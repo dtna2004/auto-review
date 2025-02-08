@@ -1,0 +1,4 @@
+ffmpeg
+imagemagick
+libmagick++-dev
+python3-dev 

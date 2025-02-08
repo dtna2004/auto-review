@@ -10,14 +10,22 @@ from moviepy.editor import (
     vfx
 )
 import time
+import logging
+import tempfile
+import shutil
+
+# Cấu hình logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Cấu hình đường dẫn cho PythonAnywhere
+# Cấu hình đường dẫn cho Render
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'uploads')
-app.config['STATIC_FOLDER'] = os.path.join(BASE_DIR, 'static')
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Tăng lên 100MB max-limit
+TEMP_DIR = tempfile.mkdtemp()  # Tạo thư mục tạm thời
+app.config['UPLOAD_FOLDER'] = os.path.join(TEMP_DIR, 'uploads')
+app.config['STATIC_FOLDER'] = os.path.join(TEMP_DIR, 'static')
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
 # Đảm bảo thư mục uploads và static tồn tại
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -27,8 +35,8 @@ os.makedirs(os.path.join(app.config['STATIC_FOLDER'], 'videos'), exist_ok=True)
 try:
     os.chmod(app.config['UPLOAD_FOLDER'], 0o777)
     os.chmod(os.path.join(app.config['STATIC_FOLDER'], 'videos'), 0o777)
-except:
-    pass
+except Exception as e:
+    logger.error(f"Error setting permissions: {str(e)}")
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 
@@ -57,72 +65,95 @@ def upload_files():
         
         for i, (file, review) in enumerate(zip(files, reviews)):
             if file and allowed_file(file.filename):
-                filename = secure_filename(file.filename)
-                image_path = os.path.join(app.config['UPLOAD_FOLDER'], f'image_{i}_{filename}')
-                file.save(image_path)
-                
-                # Chuẩn hóa kích thước ảnh
-                with Image.open(image_path) as img:
-                    # Giữ tỷ lệ khung hình 16:9
-                    target_width = 1920
-                    target_height = 1080
-                    img = img.convert('RGB')
+                try:
+                    filename = secure_filename(file.filename)
+                    image_path = os.path.join(app.config['UPLOAD_FOLDER'], f'image_{i}_{filename}')
+                    file.save(image_path)
+                    logger.info(f"Saved image to {image_path}")
                     
-                    # Tính toán kích thước mới giữ nguyên tỷ lệ
-                    ratio = min(target_width/img.width, target_height/img.height)
-                    new_size = (int(img.width * ratio), int(img.height * ratio))
-                    img = img.resize(new_size, Image.LANCZOS)
+                    # Chuẩn hóa kích thước ảnh
+                    with Image.open(image_path) as img:
+                        # Giữ tỷ lệ khung hình 16:9
+                        target_width = 1280  # Giảm kích thước xuống để xử lý nhanh hơn
+                        target_height = 720
+                        img = img.convert('RGB')
+                        
+                        ratio = min(target_width/img.width, target_height/img.height)
+                        new_size = (int(img.width * ratio), int(img.height * ratio))
+                        img = img.resize(new_size, Image.LANCZOS)
+                        
+                        background = Image.new('RGB', (target_width, target_height), (0, 0, 0))
+                        offset = ((target_width - new_size[0]) // 2,
+                                 (target_height - new_size[1]) // 2)
+                        background.paste(img, offset)
+                        background.save(image_path)
                     
-                    # Tạo ảnh nền đen
-                    background = Image.new('RGB', (target_width, target_height), (0, 0, 0))
+                    image_paths.append(image_path)
                     
-                    # Paste ảnh vào giữa
-                    offset = ((target_width - new_size[0]) // 2,
-                             (target_height - new_size[1]) // 2)
-                    background.paste(img, offset)
-                    background.save(image_path)
+                    # Tạo audio từ review text
+                    audio_path = os.path.join(app.config['UPLOAD_FOLDER'], f'audio_{i}.mp3')
+                    tts = gTTS(text=review, lang='vi')
+                    tts.save(audio_path)
+                    logger.info(f"Saved audio to {audio_path}")
+                    audio_paths.append(audio_path)
                 
-                image_paths.append(image_path)
-                
-                # Tạo audio từ review text
-                audio_path = os.path.join(app.config['UPLOAD_FOLDER'], f'audio_{i}.mp3')
-                tts = gTTS(text=review, lang='vi')
-                tts.save(audio_path)
-                audio_paths.append(audio_path)
+                except Exception as e:
+                    logger.error(f"Error processing file {filename}: {str(e)}")
+                    raise
         
         # Tạo video
         video_path = create_video(image_paths, audio_paths)
+        logger.info(f"Created video at {video_path}")
+        
+        # Copy video to static folder
+        static_video_dir = os.path.join(BASE_DIR, 'static', 'videos')
+        os.makedirs(static_video_dir, exist_ok=True)
+        final_video_path = os.path.join(static_video_dir, os.path.basename(video_path))
+        shutil.copy2(video_path, final_video_path)
         
         # Chuyển đường dẫn tương đối cho client
-        relative_path = os.path.relpath(video_path, app.config['STATIC_FOLDER'])
+        relative_path = os.path.join('videos', os.path.basename(video_path))
         return jsonify({'video_path': f'/static/{relative_path}'})
     
     except Exception as e:
+        logger.error(f"Error in upload_files: {str(e)}")
         return jsonify({'error': str(e)}), 500
+    finally:
+        # Dọn dẹp files
+        try:
+            for path in image_paths + audio_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+        except Exception as e:
+            logger.error(f"Error cleaning up files: {str(e)}")
 
 def create_video(image_paths, audio_paths):
+    clips = []
     try:
-        clips = []
-        transition_duration = 1.0  # Thời gian chuyển cảnh (giây)
+        transition_duration = 1.0
         
         for i, (img_path, audio_path) in enumerate(zip(image_paths, audio_paths)):
-            # Đọc audio để lấy thời lượng
-            audio = AudioFileClip(audio_path)
-            duration = audio.duration
-            
-            # Tạo video clip từ ảnh với thời lượng dài hơn để có chỗ cho transition
-            image = ImageClip(img_path).set_duration(duration + transition_duration)
-            
-            # Thêm audio vào clip
-            video_clip = image.set_audio(audio)
-            
-            # Thêm hiệu ứng fade in/out
-            if i > 0:  # Từ clip thứ 2 trở đi
-                video_clip = video_clip.fx(vfx.fadein, transition_duration)
-            if i < len(image_paths) - 1:  # Tất cả clip trừ clip cuối
-                video_clip = video_clip.fx(vfx.fadeout, transition_duration)
-            
-            clips.append(video_clip)
+            try:
+                # Đọc audio để lấy thời lượng
+                audio = AudioFileClip(audio_path)
+                duration = audio.duration
+                
+                # Tạo video clip từ ảnh
+                image = ImageClip(img_path).set_duration(duration + transition_duration)
+                video_clip = image.set_audio(audio)
+                
+                # Thêm hiệu ứng fade in/out
+                if i > 0:
+                    video_clip = video_clip.fx(vfx.fadein, transition_duration)
+                if i < len(image_paths) - 1:
+                    video_clip = video_clip.fx(vfx.fadeout, transition_duration)
+                
+                clips.append(video_clip)
+                logger.info(f"Processed clip {i+1}/{len(image_paths)}")
+                
+            except Exception as e:
+                logger.error(f"Error processing clip {i}: {str(e)}")
+                raise
         
         # Ghép các clip lại với nhau
         final_clip = concatenate_videoclips(clips, 
@@ -135,45 +166,26 @@ def create_video(image_paths, audio_paths):
         
         # Xuất video với cấu hình phù hợp cho web
         final_clip.write_videofile(output_path, 
-                                 fps=24,  # Giảm fps để giảm kích thước
+                                 fps=24,
                                  codec='libx264',
                                  audio_codec='aac',
-                                 bitrate='4000k',  # Giảm bitrate
+                                 bitrate='2000k',
                                  audio_bitrate='128k',
-                                 threads=2,  # Giảm số thread
-                                 preset='faster')  # Sử dụng preset nhanh hơn
-        
-        # Đóng các clip để giải phóng bộ nhớ
-        final_clip.close()
-        for clip in clips:
-            clip.close()
-            
-        # Xóa các file tạm
-        for path in image_paths + audio_paths:
-            try:
-                os.remove(path)
-            except:
-                pass
+                                 threads=2,
+                                 preset='ultrafast')  # Sử dụng preset nhanh nhất
         
         return output_path
         
     except Exception as e:
-        # Đảm bảo dọn dẹp trong trường hợp lỗi
+        logger.error(f"Error in create_video: {str(e)}")
+        raise
+    finally:
+        # Đóng các clip để giải phóng bộ nhớ
         try:
-            final_clip.close()
             for clip in clips:
                 clip.close()
-        except:
-            pass
-            
-        # Xóa các file tạm
-        for path in image_paths + audio_paths:
-            try:
-                os.remove(path)
-            except:
-                pass
-                
-        raise e
+        except Exception as e:
+            logger.error(f"Error closing clips: {str(e)}")
 
 if __name__ == '__main__':
     app.run(debug=True) 

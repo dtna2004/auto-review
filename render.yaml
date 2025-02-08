@@ -2,8 +2,15 @@ services:
   - type: web
     name: story-review-app
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      apt-get update
+      apt-get install -y $(cat apt-packages.txt)
+      pip install -r requirements.txt
     startCommand: gunicorn app:app
     envVars:
       - key: PYTHON_VERSION
-        value: 3.9.0 
+        value: 3.9.0
+      - key: IMAGEMAGICK_BINARY
+        value: /usr/bin/convert
+      - key: FFMPEG_BINARY
+        value: /usr/bin/ffmpeg 
